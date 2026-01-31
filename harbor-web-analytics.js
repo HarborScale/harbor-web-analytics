@@ -147,15 +147,15 @@
     const body = JSON.stringify(payload);
 
     // Try Beacon API first (better for page unload events)
-    if (navigator.sendBeacon) {
-      const blob = new Blob([body], { type: 'application/json' });
-      const sent = navigator.sendBeacon(url, blob);
+    //if (navigator.sendBeacon) {
+    //  const blob = new Blob([body], { type: 'application/json' });
+    //  const sent = navigator.sendBeacon(url, blob);
       
-      if (sent) {
-        debug('Event sent via Beacon API');
-        return;
-      }
-    }
+    //  if (sent) {
+    //    debug('Event sent via Beacon API');
+    //    return;
+    //  }
+    //}
 
     // Fallback to fetch
     fetch(url, {
