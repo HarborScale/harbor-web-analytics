@@ -1,492 +1,690 @@
 /**
  * Harbor Web Analytics - Privacy-First Analytics for Harbor Scale
- * Version: 1.0.0
+ * Version: 2.0.0
  */
 
 (function() {
   'use strict';
 
   // ============================================
-  // CONFIGURATION EXTRACTION
+  // 1. CONFIGURATION
   // ============================================
-  
   const script = document.currentScript || document.querySelector('script[src*="harbor-track"]');
-  if (!script) {
-    console.error('[HarborTrack] Could not find script tag. Tracking disabled.');
-    return;
-  }
+  if (!script) return;
 
-  const scriptSrc = script.src;
-  const url = new URL(scriptSrc);
-  
+  const url = new URL(script.src);
   const CONFIG = {
     harborId: url.searchParams.get('h') || script.getAttribute('data-harbor-id'),
     apiKey: url.searchParams.get('k') || script.getAttribute('data-api-key'),
     endpoint: url.searchParams.get('e') || script.getAttribute('data-endpoint') || 'https://harborscale.com/api/v2',
-    debug: url.searchParams.get('debug') === 'true' || script.hasAttribute('data-debug'),
+    debug: url.searchParams.get('debug') === 'true',
     
-    // Privacy settings
-    respectDNT: url.searchParams.get('dnt') !== 'false', // Default: respect Do Not Track
-    hashIPs: url.searchParams.get('hash-ip') !== 'false', // Default: hash IPs for privacy
-    
-    // Features (can be disabled)
-    autoPageviews: url.searchParams.get('auto-pageviews') !== 'false',
-    trackClicks: url.searchParams.get('track-clicks') !== 'false',
+    // Feature Flags (Enable/Disable modules)
+    trackForms: url.searchParams.get('track-forms') !== 'false',
     trackErrors: url.searchParams.get('track-errors') !== 'false',
-    trackPerformance: url.searchParams.get('track-perf') !== 'false',
+    trackScroll: url.searchParams.get('track-scroll') !== 'false',
+    trackClicks: url.searchParams.get('track-clicks') !== 'false',
+    trackPerf: url.searchParams.get('track-perf') !== 'false',
+    trackMouse: url.searchParams.get('track-mouse') !== 'false',  // NEW
+    trackMedia: url.searchParams.get('track-media') !== 'false',  // NEW
+    trackVisibility: url.searchParams.get('track-visibility') !== 'false',  // NEW
+    
+    batchSize: parseInt(url.searchParams.get('batch-size')) || 100,
+    batchInterval: parseInt(url.searchParams.get('batch-interval')) || 5000,
   };
 
-  // Validation
   if (!CONFIG.harborId || !CONFIG.apiKey) {
-    console.error('[HarborTrack] Missing required parameters: h (harbor ID) and k (API key)');
+    console.error('[Harbor] Missing API Key or Harbor ID');
     return;
   }
 
-  // Respect Do Not Track
-  if (CONFIG.respectDNT && (navigator.doNotTrack === '1' || navigator.doNotTrack === 'yes')) {
-    console.info('[HarborTrack] Do Not Track enabled. Tracking disabled.');
-    return;
-  }
+  if (navigator.doNotTrack === '1') return;
 
   // ============================================
-  // UTILITY FUNCTIONS
+  // 2. ENHANCED VISITOR IDENTITY
   // ============================================
-
-  /**
-   * Simple hash function for privacy (FNV-1a)
-   */
-  function simpleHash(str) {
-    let hash = 2166136261;
+  function hash(str) {
+    let h = 2166136261;
     for (let i = 0; i < str.length; i++) {
-      hash ^= str.charCodeAt(i);
-      hash += (hash << 1) + (hash << 4) + (hash << 7) + (hash << 8) + (hash << 24);
+      h ^= str.charCodeAt(i);
+      h += (h << 1) + (h << 4) + (h << 7) + (h << 8) + (h << 24);
     }
-    return (hash >>> 0).toString(36);
+    return (h >>> 0).toString(36);
   }
 
-  /**
-   * Generate a session ID (stored in sessionStorage)
-   */
-  function getSessionId() {
-    const key = '_ht_sid';
-    let sid = sessionStorage.getItem(key);
-    if (!sid) {
-      sid = simpleHash(Date.now() + Math.random().toString());
-      sessionStorage.setItem(key, sid);
+  function getVisitorId() {
+    try {
+      const sessionKey = '_ht_sid';
+      let sid = sessionStorage.getItem(sessionKey);
+      if (!sid) {
+        sid = hash(Date.now() + Math.random().toString());
+        sessionStorage.setItem(sessionKey, sid);
+      }
+      // Enhanced fingerprint
+      const traits = [
+        navigator.language || '',
+        new Date().getTimezoneOffset(),
+        window.screen.width + 'x' + window.screen.height,
+        window.screen.colorDepth,
+        navigator.hardwareConcurrency || 1,
+        navigator.deviceMemory || 1,
+        navigator.platform || '',
+        !!window.indexedDB,
+        !!window.sessionStorage,
+        navigator.maxTouchPoints || 0
+      ].join('|');
+      return `${sid}_${hash(traits)}`;
+    } catch (e) {
+      return 'unknown_visitor';
     }
-    return sid;
-  }
-
-  /**
-   * Get a privacy-safe user identifier
-   * Uses: session ID + hashed user agent (no IPs, no cookies)
-   */
-  function getShipId() {
-    const session = getSessionId();
-    const ua = CONFIG.hashIPs ? simpleHash(navigator.userAgent) : navigator.userAgent.slice(0, 50);
-    return `${session}_${ua}`;
-  }
-
-  /**
-   * Log debug messages
-   */
-  function debug(...args) {
-    if (CONFIG.debug) {
-      console.log('[HarborTrack]', ...args);
-    }
-  }
-
-  /**
-   * Debounce function to prevent spam
-   */
-  function debounce(func, wait) {
-    let timeout;
-    return function executedFunction(...args) {
-      const later = () => {
-        clearTimeout(timeout);
-        func(...args);
-      };
-      clearTimeout(timeout);
-      timeout = setTimeout(later, wait);
-    };
   }
 
   // ============================================
-  // CORE TRACKING FUNCTION
+  // 3. BATCHED STREAMING ENGINE (100 events/batch)
   // ============================================
+  const QUEUE = [];
+  let batchTimer = null;
+  const SESSION_START = Date.now();
 
-  /**
-   * Send event to Harbor Scale
-   * @param {string} eventName - The cargo_id (event type)
-   * @param {number} value - Numeric value (default: 1)
-   * @param {object} metadata - Additional data (stored in memory, not sent)
-   */
   function track(eventName, value = 1, metadata = {}) {
-    // Input validation
-    if (!eventName || typeof eventName !== 'string') {
-      console.warn('[HarborTrack] Invalid event name:', eventName);
-      return;
-    }
-
-    // Prepare payload matching your SensorData model
     const payload = {
       time: new Date().toISOString(),
-      ship_id: getShipId(),
+      ship_id: getVisitorId(),
       cargo_id: eventName,
-      value: typeof value === 'number' ? value : 1
+      value: value,
+      url: window.location.pathname,
+      session_duration: Math.round((Date.now() - SESSION_START) / 1000),
+      ...metadata
     };
 
-    debug('Tracking event:', eventName, 'Value:', value, 'Metadata:', metadata);
+    // Enhanced connection info
+    const conn = navigator.connection;
+    if (conn) {
+      payload.conn_type = conn.effectiveType;
+      payload.conn_rtt = conn.rtt;
+      payload.conn_downlink = conn.downlink;
+      payload.conn_save_data = conn.saveData;
+    }
 
-    // Send via Beacon API (survives page unload) with fallback to fetch
-    const url = `${CONFIG.endpoint}/ingest/${CONFIG.harborId}`;
-    const headers = {
-      'Content-Type': 'application/json',
-      'X-API-Key': CONFIG.apiKey
-    };
-    const body = JSON.stringify(payload);
+    QUEUE.push(payload);
+    if (CONFIG.debug) console.log(`[Harbor] Queued (${QUEUE.length}):`, eventName, payload);
+    
+    // Auto-flush when batch size reached
+    if (QUEUE.length >= CONFIG.batchSize) {
+      flushBatch();
+    } else if (!batchTimer) {
+      batchTimer = setTimeout(flushBatch, CONFIG.batchInterval);
+    }
+  }
 
-    // Try Beacon API first (better for page unload events)
-    //if (navigator.sendBeacon) {
-    //  const blob = new Blob([body], { type: 'application/json' });
-    //  const sent = navigator.sendBeacon(url, blob);
-      
-    //  if (sent) {
-    //    debug('Event sent via Beacon API');
-    //    return;
-    //  }
-    //}
-
-    // Fallback to fetch
-    fetch(url, {
+  function flushBatch() {
+    if (QUEUE.length === 0) return;
+    
+    clearTimeout(batchTimer);
+    batchTimer = null;
+    
+    const batch = QUEUE.splice(0, CONFIG.batchSize);
+    
+    fetch(`${CONFIG.endpoint}/ingest/${CONFIG.harborId}`, {
       method: 'POST',
-      headers: headers,
-      body: body,
-      keepalive: true // Important for unload events
+      headers: { 
+        'Content-Type': 'application/json', 
+        'X-API-Key': CONFIG.apiKey,
+        'X-Batch-Size': batch.length.toString()
+      },
+      body: JSON.stringify({ events: batch }),
+      keepalive: true
     })
-    .then(response => {
-      if (!response.ok) {
-        throw new Error(`HTTP ${response.status}`);
-      }
-      debug('Event sent via Fetch API');
+    .then(() => {
+      if (CONFIG.debug) console.log(`[Harbor] Flushed ${batch.length} events`);
     })
-    .catch(error => {
-      console.error('[HarborTrack] Failed to send event:', error);
+    .catch(err => {
+      if (CONFIG.debug) console.error('[Harbor] Flush failed:', err);
+      QUEUE.unshift(...batch); // Re-queue on failure
     });
+    
+    // Continue processing if more events
+    if (QUEUE.length > 0) {
+      batchTimer = setTimeout(flushBatch, CONFIG.batchInterval);
+    }
   }
 
-  // ============================================
-  // AUTO-TRACKING FEATURES
-  // ============================================
-
-  /**
-   * Track page views automatically
-   */
-  if (CONFIG.autoPageviews) {
-    // Initial page view
-    track('pageview', 1, {
-      path: window.location.pathname,
-      referrer: document.referrer
-    });
-
-    // Track SPA navigation (History API)
-    const originalPushState = history.pushState;
-    const originalReplaceState = history.replaceState;
-
-    history.pushState = function(...args) {
-      originalPushState.apply(this, args);
-      track('pageview', 1, { path: window.location.pathname });
-    };
-
-    history.replaceState = function(...args) {
-      originalReplaceState.apply(this, args);
-      track('pageview', 1, { path: window.location.pathname });
-    };
-
-    window.addEventListener('popstate', () => {
-      track('pageview', 1, { path: window.location.pathname });
-    });
-  }
-
-  /**
-   * Track clicks on elements with data-track attribute
-   */
-  if (CONFIG.trackClicks) {
-    document.addEventListener('click', (e) => {
-      const element = e.target.closest('[data-track]');
-      if (!element) return;
-
-      const eventName = element.getAttribute('data-track');
-      const value = parseFloat(element.getAttribute('data-track-value')) || 1;
-
-      track(`click_${eventName}`, value, {
-        text: element.textContent.trim().slice(0, 50),
-        tag: element.tagName
-      });
-    }, true);
-
-    // Track external links
-    document.addEventListener('click', (e) => {
-      const link = e.target.closest('a[href]');
-      if (!link) return;
-
-      try {
-        const url = new URL(link.href, window.location.href);
-        if (url.hostname !== window.location.hostname) {
-          track('outbound_link', 1, {
-            url: url.hostname
-          });
-        }
-      } catch (err) {
-        // Invalid URL, ignore
-      }
-    }, true);
-  }
-
-  /**
-   * Track JavaScript errors
-   */
-  if (CONFIG.trackErrors) {
-    window.addEventListener('error', (event) => {
-      track('js_error', 1, {
-        message: event.message,
-        filename: event.filename,
-        lineno: event.lineno,
-        colno: event.colno
-      });
-    });
-
-    // Track unhandled promise rejections
-    window.addEventListener('unhandledrejection', (event) => {
-      track('promise_rejection', 1, {
-        reason: event.reason?.message || String(event.reason)
-      });
-    });
-  }
-
-  /**
-   * Track basic performance metrics
-   */
-  if (CONFIG.trackPerformance) {
-    window.addEventListener('load', () => {
-      // Wait for performance data to be available
-      setTimeout(() => {
-        if (!window.performance || !window.performance.timing) return;
-
-        const timing = window.performance.timing;
-        const loadTime = timing.loadEventEnd - timing.navigationStart;
-        const domReady = timing.domContentLoadedEventEnd - timing.navigationStart;
-        const ttfb = timing.responseStart - timing.navigationStart;
-
-        if (loadTime > 0) track('page_load_time', loadTime);
-        if (domReady > 0) track('dom_ready_time', domReady);
-        if (ttfb > 0) track('time_to_first_byte', ttfb);
-
-        // Core Web Vitals (if available)
-        if (window.PerformanceObserver) {
-          // Largest Contentful Paint (LCP)
-          try {
-            const lcpObserver = new PerformanceObserver((list) => {
-              const entries = list.getEntries();
-              const lastEntry = entries[entries.length - 1];
-              track('lcp', Math.round(lastEntry.renderTime || lastEntry.loadTime));
-              lcpObserver.disconnect();
-            });
-            lcpObserver.observe({ entryTypes: ['largest-contentful-paint'] });
-          } catch (e) {}
-
-          // First Input Delay (FID)
-          try {
-            const fidObserver = new PerformanceObserver((list) => {
-              const entries = list.getEntries();
-              entries.forEach((entry) => {
-                track('fid', Math.round(entry.processingStart - entry.startTime));
-              });
-              fidObserver.disconnect();
-            });
-            fidObserver.observe({ entryTypes: ['first-input'] });
-          } catch (e) {}
-
-          // Cumulative Layout Shift (CLS)
-          try {
-            let clsValue = 0;
-            const clsObserver = new PerformanceObserver((list) => {
-              for (const entry of list.getEntries()) {
-                if (!entry.hadRecentInput) {
-                  clsValue += entry.value;
-                }
-              }
-            });
-            clsObserver.observe({ entryTypes: ['layout-shift'] });
-
-            // Report CLS on page hide
-            document.addEventListener('visibilitychange', () => {
-              if (document.visibilityState === 'hidden') {
-                track('cls', Math.round(clsValue * 1000));
-                clsObserver.disconnect();
-              }
-            });
-          } catch (e) {}
-        }
-      }, 0);
-    });
-  }
-
-  // ============================================
-  // ADVANCED TRACKING HELPERS
-  // ============================================
-
-  /**
-   * Track scroll depth (25%, 50%, 75%, 100%)
-   */
-  function trackScrollDepth() {
-    const milestones = [25, 50, 75, 100];
-    const reached = new Set();
-
-    const checkScroll = debounce(() => {
-      const scrollPercent = Math.round(
-        (window.scrollY / (document.documentElement.scrollHeight - window.innerHeight)) * 100
+  // Flush on page unload
+  window.addEventListener('beforeunload', () => {
+    if (QUEUE.length > 0) {
+      navigator.sendBeacon(
+        `${CONFIG.endpoint}/ingest/${CONFIG.harborId}`,
+        JSON.stringify({ events: QUEUE, api_key: CONFIG.apiKey })
       );
+    }
+  });
 
-      milestones.forEach(milestone => {
-        if (scrollPercent >= milestone && !reached.has(milestone)) {
-          reached.add(milestone);
-          track('scroll_depth', milestone, {
-            page: window.location.pathname
-          });
-        }
-      });
-    }, 500);
-
-    window.addEventListener('scroll', checkScroll);
-    window.addEventListener('resize', checkScroll);
-  }
-
-  /**
-   * Track time on page (sends when user leaves)
-   */
-  function trackTimeOnPage() {
-    const startTime = Date.now();
-    let isActive = true;
-    let totalActiveTime = 0;
-    let lastActiveTime = startTime;
-
-    // Track when user becomes inactive
-    const handleVisibilityChange = () => {
-      if (document.hidden) {
-        if (isActive) {
-          totalActiveTime += Date.now() - lastActiveTime;
-          isActive = false;
-        }
-      } else {
-        isActive = true;
-        lastActiveTime = Date.now();
-      }
+  // ============================================
+  // 4. ENHANCED DEVICE & ENVIRONMENT CONTEXT
+  // ============================================
+  function getDeviceContext() {
+    return {
+      viewport_w: window.innerWidth,
+      viewport_h: window.innerHeight,
+      screen_w: window.screen.width,
+      screen_h: window.screen.height,
+      dpr: window.devicePixelRatio || 1,
+      orientation: window.screen.orientation?.type || 'unknown',
+      touch_support: navigator.maxTouchPoints > 0,
+      battery_level: null, // Will be enriched async
+      battery_charging: null,
+      memory: navigator.deviceMemory,
+      cores: navigator.hardwareConcurrency,
     };
+  }
 
-    document.addEventListener('visibilitychange', handleVisibilityChange);
-
-    // Send data when user leaves
-    window.addEventListener('beforeunload', () => {
-      if (isActive) {
-        totalActiveTime += Date.now() - lastActiveTime;
-      }
-      const timeOnPage = Math.round(totalActiveTime / 1000); // Convert to seconds
-      track('time_on_page', timeOnPage, {
-        page: window.location.pathname
+  // Enrich with battery status (async)
+  if (navigator.getBattery) {
+    navigator.getBattery().then(battery => {
+      track('device_battery', Math.round(battery.level * 100), {
+        charging: battery.charging,
+        charge_time: battery.chargingTime,
+        discharge_time: battery.dischargingTime
       });
     });
   }
 
-  /**
-   * Track form interactions
-   */
-  function trackForm(formSelector) {
-    const form = document.querySelector(formSelector);
-    if (!form) return;
+  // Track initial device context
+  track('session_start', 1, getDeviceContext());
 
-    const formId = form.id || 'unnamed_form';
-    const fieldsInteracted = new Set();
+  // ============================================
+  // 5. DEEP TRACKING MODULES (ENHANCED)
+  // ============================================
 
-    // Track field interactions
-    form.querySelectorAll('input, textarea, select').forEach(field => {
-      field.addEventListener('focus', () => {
-        const fieldName = field.name || field.id || 'unnamed_field';
-        if (!fieldsInteracted.has(fieldName)) {
-          fieldsInteracted.add(fieldName);
-          track('form_field_focus', 1, {
-            form: formId,
-            field: fieldName
+  // A. PAGEVIEWS (SPA Aware + Timing)
+  let pageLoadTime = Date.now();
+  const logPage = () => {
+    const timeOnPreviousPage = Date.now() - pageLoadTime;
+    pageLoadTime = Date.now();
+    
+    track('pageview', 1, { 
+      ref: document.referrer,
+      time_on_prev_page: timeOnPreviousPage > 100 ? Math.round(timeOnPreviousPage / 1000) : 0,
+      title: document.title,
+      query_params: window.location.search ? 1 : 0,
+      hash: window.location.hash ? 1 : 0
+    });
+  };
+  
+  logPage();
+  const pushState = history.pushState;
+  history.pushState = function(...args) {
+    pushState.apply(this, args);
+    logPage();
+  };
+  window.addEventListener('popstate', logPage);
+
+  // B. ENHANCED FORM TRACKING
+  if (CONFIG.trackForms) {
+    const formStates = new Map();
+    
+    document.addEventListener('focus', (e) => {
+      if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA') {
+        const form = e.target.form;
+        const formId = form ? (form.id || form.name || 'form_' + hash(form.outerHTML.slice(0, 100))) : 'no_form';
+        
+        if (!formStates.has(formId)) {
+          formStates.set(formId, {
+            started_at: Date.now(),
+            fields_focused: new Set(),
+            fields_changed: new Set(),
+            field_count: form ? form.elements.length : 0
+          });
+        }
+        
+        const state = formStates.get(formId);
+        state.fields_focused.add(e.target.name || e.target.id || 'unknown');
+        
+        track('form_focus', Math.round((Date.now() - state.started_at) / 1000), {
+          field: e.target.name || e.target.id || 'unknown',
+          field_type: e.target.type || e.target.tagName.toLowerCase(),
+          form_id: formId,
+          fields_focused_count: state.fields_focused.size
+        });
+      }
+    }, true);
+
+    document.addEventListener('change', (e) => {
+      if (e.target.tagName === 'INPUT' || e.target.tagName === 'SELECT' || e.target.tagName === 'TEXTAREA') {
+        const form = e.target.form;
+        const formId = form ? (form.id || form.name || 'form_' + hash(form.outerHTML.slice(0, 100))) : 'no_form';
+        
+        if (formStates.has(formId)) {
+          formStates.get(formId).fields_changed.add(e.target.name || e.target.id || 'unknown');
+        }
+        
+        track('form_change', e.target.value ? e.target.value.length : 0, { 
+          field: e.target.name || e.target.id,
+          field_type: e.target.type || e.target.tagName.toLowerCase(),
+          form_id: formId
+        });
+      }
+    }, true);
+    
+    document.addEventListener('submit', (e) => {
+      const formId = e.target.id || e.target.name || 'form_' + hash(e.target.outerHTML.slice(0, 100));
+      const state = formStates.get(formId);
+      
+      track('form_submit', state ? Math.round((Date.now() - state.started_at) / 1000) : 0, { 
+        form_id: formId,
+        fields_total: state ? state.field_count : 0,
+        fields_focused: state ? state.fields_focused.size : 0,
+        fields_changed: state ? state.fields_changed.size : 0,
+        completion_rate: state ? Math.round((state.fields_changed.size / state.field_count) * 100) : 0
+      });
+      
+      formStates.delete(formId);
+    });
+    
+    // Form abandonment tracking
+    setInterval(() => {
+      formStates.forEach((state, formId) => {
+        const timeInForm = (Date.now() - state.started_at) / 1000;
+        if (timeInForm > 30 && state.fields_changed.size > 0) {
+          track('form_abandonment_risk', Math.round(timeInForm), {
+            form_id: formId,
+            fields_changed: state.fields_changed.size,
+            fields_total: state.field_count
           });
         }
       });
+    }, 30000);
+  }
 
-      field.addEventListener('blur', () => {
-        if (field.value) {
-          track('form_field_filled', 1, {
-            form: formId,
-            field: field.name || field.id || 'unnamed_field'
+  // C. ENHANCED ERROR TRACKING
+  if (CONFIG.trackErrors) {
+    const errorCounts = new Map();
+    
+    window.addEventListener('error', (e) => {
+      const errorKey = `${e.message}_${e.filename}_${e.lineno}`;
+      const count = (errorCounts.get(errorKey) || 0) + 1;
+      errorCounts.set(errorKey, count);
+      
+      track('js_error', 1, { 
+        msg: e.message.slice(0, 100), 
+        file: e.filename, 
+        line: e.lineno,
+        col: e.colno,
+        stack: e.error?.stack?.slice(0, 200),
+        occurrence_count: count
+      });
+    });
+    
+    window.addEventListener('unhandledrejection', (e) => {
+      track('promise_error', 1, { 
+        reason: e.reason ? e.reason.toString().slice(0, 100) : 'unknown',
+        promise: e.promise ? 'Promise' : 'unknown'
+      });
+    });
+    
+    // Console error tracking (non-intrusive)
+    const originalError = console.error;
+    console.error = function(...args) {
+      track('console_error', 1, { msg: args.join(' ').slice(0, 100) });
+      originalError.apply(console, args);
+    };
+  }
+
+  // D. ENHANCED CLICK TRACKING
+  if (CONFIG.trackClicks) {
+    let clicks = [];
+    const clickedElements = new Set();
+    
+    document.addEventListener('click', (e) => {
+      const now = Date.now();
+      const el = e.target.closest('button, a, [data-track], input, div, span');
+      
+      // 1. Enhanced general tracking
+      if (el) {
+        const elementId = el.id || el.className || el.tagName;
+        const elementKey = `${elementId}_${el.textContent?.slice(0, 20)}`;
+        clickedElements.add(elementKey);
+        
+        track('click', Math.round((e.clientX / window.innerWidth) * 100), {
+          element_type: el.tagName.toLowerCase(),
+          element_id: el.id || 'no_id',
+          element_class: el.className ? el.className.split(' ')[0] : 'no_class',
+          element_text: el.textContent?.trim().slice(0, 30) || '',
+          data_track: el.getAttribute('data-track') || null,
+          is_link: el.tagName === 'A' ? 1 : 0,
+          is_button: el.tagName === 'BUTTON' || el.type === 'button' ? 1 : 0,
+          has_href: el.href ? 1 : 0,
+          viewport_y: Math.round((e.clientY / window.innerHeight) * 100)
+        });
+      }
+
+      // 2. Rage Click Detection (3 clicks in 1s)
+      clicks.push({ x: e.clientX, y: e.clientY, t: now });
+      clicks = clicks.filter(c => now - c.t < 1000);
+      
+      if (clicks.length >= 3) {
+        const isRage = clicks.every(c => 
+          Math.abs(c.x - clicks[0].x) < 20 && Math.abs(c.y - clicks[0].y) < 20
+        );
+        if (isRage) {
+          track('rage_click', clicks.length, { 
+            tag: e.target.tagName,
+            text: e.target.textContent?.slice(0, 20),
+            x: e.clientX,
+            y: e.clientY
+          });
+          clicks = [];
+        }
+      }
+      
+      // 3. Dead Click Detection
+      const style = window.getComputedStyle(e.target);
+      if (style.cursor === 'pointer' && !e.target.href && !e.target.onclick && 
+          e.target.tagName !== 'BUTTON' && e.target.tagName !== 'INPUT') {
+        track('dead_click', 1, { 
+          text: e.target.textContent?.slice(0, 20),
+          tag: e.target.tagName,
+          class: e.target.className
+        });
+      }
+    }, true);
+    
+    // Click coverage tracking
+    setInterval(() => {
+      track('click_coverage', clickedElements.size);
+    }, 60000);
+  }
+
+  // E. ENHANCED SCROLL TRACKING
+  if (CONFIG.trackScroll) {
+    const marks = [10, 25, 50, 75, 90, 100];
+    const reached = new Set();
+    let scrollTimer;
+    let maxScroll = 0;
+    let scrollCount = 0;
+    let lastScrollTime = Date.now();
+    
+    window.addEventListener('scroll', () => {
+      scrollCount++;
+      const timeSinceLastScroll = Date.now() - lastScrollTime;
+      lastScrollTime = Date.now();
+      
+      clearTimeout(scrollTimer);
+      scrollTimer = setTimeout(() => {
+        const scrollTop = window.scrollY;
+        const scrollHeight = document.documentElement.scrollHeight - window.innerHeight;
+        const pct = Math.round((scrollTop / scrollHeight) * 100);
+        
+        maxScroll = Math.max(maxScroll, pct);
+        
+        marks.forEach(m => {
+          if (pct >= m && !reached.has(m)) {
+            reached.add(m);
+            track('scroll_milestone', m, {
+              scroll_count: scrollCount,
+              time_to_milestone: Math.round((Date.now() - pageLoadTime) / 1000),
+              scroll_speed_ms: timeSinceLastScroll
+            });
+          }
+        });
+        
+        // Scroll depth heartbeat
+        if (scrollCount % 20 === 0) {
+          track('scroll_depth', maxScroll, {
+            total_scrolls: scrollCount,
+            page_height: Math.round(document.documentElement.scrollHeight)
           });
         }
-      });
+      }, 200);
     });
-
-    // Track submission
-    form.addEventListener('submit', () => {
-      track('form_submit', 1, {
-        form: formId,
-        fields_count: fieldsInteracted.size
-      });
-    });
-
-    // Track abandonment (user leaves without submitting)
-    let formSubmitted = false;
-    form.addEventListener('submit', () => { formSubmitted = true; });
-
+    
+    // Report final scroll depth on page leave
     window.addEventListener('beforeunload', () => {
-      if (fieldsInteracted.size > 0 && !formSubmitted) {
-        track('form_abandoned', fieldsInteracted.size, {
-          form: formId
+      track('final_scroll_depth', maxScroll, { scroll_count: scrollCount });
+    });
+  }
+
+  // F. ENHANCED PERFORMANCE (Web Vitals + More)
+  if (CONFIG.trackPerf && window.PerformanceObserver) {
+    const observe = (type, cb) => {
+      try { 
+        new PerformanceObserver(l => l.getEntries().forEach(cb)).observe({entryTypes:[type], buffered: true}); 
+      } catch(e){}
+    };
+    
+    observe('largest-contentful-paint', e => {
+      track('lcp', Math.round(e.renderTime || e.loadTime), {
+        element: e.element?.tagName || 'unknown',
+        url: e.url || 'none'
+      });
+    });
+    
+    observe('first-input', e => {
+      track('fid', Math.round(e.processingStart - e.startTime), {
+        event_type: e.name,
+        target: e.target?.tagName || 'unknown'
+      });
+    });
+    
+    observe('layout-shift', e => { 
+      if (!e.hadRecentInput) {
+        track('cls', Math.round(e.value * 1000), {
+          sources: e.sources?.length || 0
         });
       }
     });
+    
+    // Navigation Timing
+    window.addEventListener('load', () => {
+      setTimeout(() => {
+        const nav = performance.getEntriesByType('navigation')[0];
+        if (nav) {
+          track('page_load_complete', Math.round(nav.loadEventEnd), {
+            dns: Math.round(nav.domainLookupEnd - nav.domainLookupStart),
+            tcp: Math.round(nav.connectEnd - nav.connectStart),
+            ttfb: Math.round(nav.responseStart - nav.requestStart),
+            download: Math.round(nav.responseEnd - nav.responseStart),
+            dom_parse: Math.round(nav.domContentLoadedEventEnd - nav.responseEnd),
+            dom_interactive: Math.round(nav.domInteractive - nav.fetchStart),
+            total_load: Math.round(nav.loadEventEnd - nav.fetchStart)
+          });
+        }
+        
+        // Resource timing summary
+        const resources = performance.getEntriesByType('resource');
+        const byType = {};
+        resources.forEach(r => {
+          const type = r.initiatorType;
+          if (!byType[type]) byType[type] = { count: 0, size: 0, duration: 0 };
+          byType[type].count++;
+          byType[type].size += r.transferSize || 0;
+          byType[type].duration += r.duration;
+        });
+        
+        Object.keys(byType).forEach(type => {
+          track(`resource_${type}`, byType[type].count, {
+            total_size: Math.round(byType[type].size / 1024), // KB
+            avg_duration: Math.round(byType[type].duration / byType[type].count)
+          });
+        });
+      }, 0);
+    });
+    
+    // Long Tasks (> 50ms)
+    observe('longtask', e => {
+      track('long_task', Math.round(e.duration), {
+        attribution: e.attribution?.[0]?.name || 'unknown'
+      });
+    });
   }
 
-  // ============================================
-  // PUBLIC API
-  // ============================================
+  // G. MOUSE MOVEMENT & ENGAGEMENT
+  if (CONFIG.trackMouse) {
+    let mouseMovements = 0;
+    let mouseIdleTime = 0;
+    let lastMouseMove = Date.now();
+    let mouseMovementTimer;
+    
+    document.addEventListener('mousemove', () => {
+      mouseMovements++;
+      lastMouseMove = Date.now();
+      mouseIdleTime = 0;
+      
+      clearTimeout(mouseMovementTimer);
+      mouseMovementTimer = setTimeout(() => {
+        if (mouseMovements > 50) {
+          track('mouse_activity', mouseMovements, {
+            idle_time: Math.round((Date.now() - lastMouseMove) / 1000)
+          });
+          mouseMovements = 0;
+        }
+      }, 5000);
+    });
+    
+    // Mouse idle detection
+    setInterval(() => {
+      const idleSeconds = Math.round((Date.now() - lastMouseMove) / 1000);
+      if (idleSeconds > 30 && idleSeconds % 30 === 0) {
+        track('mouse_idle', idleSeconds);
+      }
+    }, 30000);
+  }
 
-  window.harbor = {
-    track: track,
-    trackScrollDepth: trackScrollDepth,
-    trackTimeOnPage: trackTimeOnPage,
-    trackForm: trackForm,
+  // H. MEDIA TRACKING (Video/Audio)
+  if (CONFIG.trackMedia) {
+    const trackMediaEvent = (media, event) => {
+      const mediaId = media.src || media.currentSrc || 'unknown';
+      track(`media_${event}`, 1, {
+        media_type: media.tagName.toLowerCase(),
+        media_src: mediaId.split('/').pop()?.slice(0, 50) || 'unknown',
+        duration: Math.round(media.duration) || 0,
+        current_time: Math.round(media.currentTime) || 0,
+        percent: media.duration ? Math.round((media.currentTime / media.duration) * 100) : 0
+      });
+    };
     
-    // Utility to manually trigger pageview (for SPAs)
-    pageview: function(path) {
-      track('pageview', 1, { path: path || window.location.pathname });
-    },
+    document.addEventListener('play', (e) => {
+      if (e.target.tagName === 'VIDEO' || e.target.tagName === 'AUDIO') {
+        trackMediaEvent(e.target, 'play');
+      }
+    }, true);
     
-    // Expose config for debugging
-    getConfig: function() {
-      return { ...CONFIG, apiKey: '***hidden***' };
-    }
+    document.addEventListener('pause', (e) => {
+      if (e.target.tagName === 'VIDEO' || e.target.tagName === 'AUDIO') {
+        trackMediaEvent(e.target, 'pause');
+      }
+    }, true);
+    
+    document.addEventListener('ended', (e) => {
+      if (e.target.tagName === 'VIDEO' || e.target.tagName === 'AUDIO') {
+        trackMediaEvent(e.target, 'ended');
+      }
+    }, true);
+    
+    document.addEventListener('volumechange', (e) => {
+      if (e.target.tagName === 'VIDEO' || e.target.tagName === 'AUDIO') {
+        track('media_volume_change', Math.round(e.target.volume * 100), {
+          muted: e.target.muted ? 1 : 0
+        });
+      }
+    }, true);
+  }
+
+  // I. VISIBILITY & ENGAGEMENT
+  if (CONFIG.trackVisibility) {
+    let visibilityStartTime = Date.now();
+    let totalVisibleTime = 0;
+    let visibilityChanges = 0;
+    
+    document.addEventListener('visibilitychange', () => {
+      visibilityChanges++;
+      
+      if (document.hidden) {
+        const visibleDuration = Date.now() - visibilityStartTime;
+        totalVisibleTime += visibleDuration;
+        
+        track('page_hidden', Math.round(visibleDuration / 1000), {
+          total_visible_time: Math.round(totalVisibleTime / 1000),
+          visibility_changes: visibilityChanges
+        });
+      } else {
+        visibilityStartTime = Date.now();
+        track('page_visible', 1);
+      }
+    });
+    
+    // Periodic engagement heartbeat
+    setInterval(() => {
+      if (!document.hidden) {
+        const engagementTime = Math.round((Date.now() - visibilityStartTime) / 1000);
+        track('engagement_heartbeat', engagementTime, {
+          total_visible_time: Math.round(totalVisibleTime / 1000)
+        });
+      }
+    }, 30000);
+  }
+
+  // J. COPY/PASTE TRACKING
+  document.addEventListener('copy', (e) => {
+    const selectedText = window.getSelection()?.toString() || '';
+    track('copy', selectedText.length, {
+      text_preview: selectedText.slice(0, 30)
+    });
+  });
+  
+  document.addEventListener('paste', (e) => {
+    track('paste', 1, {
+      target: e.target?.tagName || 'unknown'
+    });
+  });
+
+  // K. WINDOW RESIZE
+  let resizeTimer;
+  window.addEventListener('resize', () => {
+    clearTimeout(resizeTimer);
+    resizeTimer = setTimeout(() => {
+      track('window_resize', 1, {
+        width: window.innerWidth,
+        height: window.innerHeight,
+        orientation: window.screen.orientation?.type || 'unknown'
+      });
+    }, 500);
+  });
+
+  // L. PRINT TRACKING
+  window.addEventListener('beforeprint', () => {
+    track('page_print', 1);
+  });
+
+  // M. RIGHT CLICK TRACKING
+  document.addEventListener('contextmenu', (e) => {
+    track('right_click', 1, {
+      element: e.target?.tagName || 'unknown',
+      text: e.target?.textContent?.slice(0, 20) || ''
+    });
+  });
+
+  // ============================================
+  // 6. SESSION SUMMARY (On Exit)
+  // ============================================
+  window.addEventListener('beforeunload', () => {
+    const sessionDuration = Math.round((Date.now() - SESSION_START) / 1000);
+    track('session_end', sessionDuration, {
+      ...getDeviceContext(),
+      total_events: QUEUE.length
+    });
+  });
+
+  // Expose enhanced API
+  window.harbor = { 
+    track,
+    flush: flushBatch,
+    getVisitorId,
+    debug: () => ({
+      queueSize: QUEUE.length,
+      sessionDuration: Math.round((Date.now() - SESSION_START) / 1000),
+      config: CONFIG
+    })
   };
-
-  debug('Harbor Track initialized', window.harbor.getConfig());
-
-  // ============================================
-  // OPTIONAL AUTO-INIT FEATURES
-  // ============================================
-
-  // Auto-enable scroll tracking if data-track-scroll is present
-  if (script.hasAttribute('data-track-scroll')) {
-    trackScrollDepth();
-  }
-
-  // Auto-enable time tracking if data-track-time is present
-  if (script.hasAttribute('data-track-time')) {
-    trackTimeOnPage();
-  }
 
 })();
