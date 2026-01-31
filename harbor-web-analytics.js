@@ -130,7 +130,6 @@
       headers: { 
         'Content-Type': 'application/json', 
         'X-API-Key': CONFIG.apiKey,
-        'X-Batch-Size': batch.length.toString()
       },
       body: JSON.stringify({ events: batch }),
       keepalive: true
