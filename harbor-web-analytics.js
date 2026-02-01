@@ -1,6 +1,7 @@
 /**
  * Harbor Web Analytics - Privacy-First Analytics for Harbor Scale
  * Version: 2.0.0
+ * Now collecting 50+ metrics
  */
 
 (function() {
@@ -129,9 +130,9 @@
       method: 'POST',
       headers: { 
         'Content-Type': 'application/json', 
-        'X-API-Key': CONFIG.apiKey,
+        'X-API-Key': CONFIG.apiKey
       },
-      body: JSON.stringify({ events: batch }),
+      body: JSON.stringify(batch),
       keepalive: true
     })
     .then(() => {
@@ -152,8 +153,8 @@
   window.addEventListener('beforeunload', () => {
     if (QUEUE.length > 0) {
       navigator.sendBeacon(
-        `${CONFIG.endpoint}/ingest/${CONFIG.harborId}`,
-        JSON.stringify({ events: QUEUE, api_key: CONFIG.apiKey })
+        `${CONFIG.endpoint}/ingest/${CONFIG.harborId}?k=${CONFIG.apiKey}`,
+        JSON.stringify(QUEUE)
       );
     }
   });
