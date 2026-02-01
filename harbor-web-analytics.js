@@ -126,7 +126,7 @@
     
     const batch = QUEUE.splice(0, CONFIG.batchSize);
     
-    fetch(`${CONFIG.endpoint}/ingest/${CONFIG.harborId}`, {
+    fetch(`${CONFIG.endpoint}/ingest/${CONFIG.harborId}/batch`, {
       method: 'POST',
       headers: { 
         'Content-Type': 'application/json', 
